@@ -42,7 +42,7 @@ SWITCH_MODULE_DEFINITION(mod_rayo, mod_rayo_load, mod_rayo_shutdown, mod_rayo_ru
 #define RAYO_CAUSE_HANGUP SWITCH_CAUSE_NORMAL_CLEARING
 #define RAYO_CAUSE_DECLINE SWITCH_CAUSE_CALL_REJECTED
 #define RAYO_CAUSE_BUSY SWITCH_CAUSE_USER_BUSY
-#define RAYO_CAUSE_ERROR SWITCH_CAUSE_NORMAL_TEMPORARY_FAILURE
+#define RAYO_CAUSE_ERROR SWITCH_CAUSE_NO_ROUTE_DESTINATION
 
 #define RAYO_END_REASON_HANGUP "hungup"
 #define RAYO_END_REASON_HANGUP_LOCAL "hangup-command"
@@ -64,6 +64,7 @@ SWITCH_MODULE_DEFINITION(mod_rayo, mod_rayo_load, mod_rayo_shutdown, mod_rayo_ru
 #define OFFER_ALL 0
 #define OFFER_FIRST 1
 #define OFFER_RANDOM 2
+#define OFFER_FIXED 3
 
 struct rayo_actor;
 struct rayo_client;
@@ -249,6 +250,8 @@ static struct {
 	int add_variables_to_events;
 	/** How to distribute offers to clients */
 	int offer_algorithm;
+	/** Fixed Offer Destination JID */
+	char *offer_to_jid;
 	/** How long to wait for offer response before retrying */
 	int offer_timeout_us;
 } globals;
@@ -510,7 +513,15 @@ static void add_headers_to_event(iks *node, switch_event_t *event, int add_varia
 				snprintf(header_name, 1024, "variable-%s", header->name + 9);
 				add_header(node, header_name, header->value);
 			}
-		}
+		} else if (!strcmp("variable_rtp_audio_in_mos", header->name)) {
+				if (!zstr(header->name)) {				
+ 				add_header(node, "audio_in_mos", header->value);
+ 				}
+ 		} else if (!strcmp("variable_rtp_audio_in_quality_percentage", header->name)) {
+ 			if (!zstr(header->name)) { 				
+ 				add_header(node, "audio_in_quality", header->value);
+ 			}
+ 		}
 	}
 }
 
@@ -2025,12 +2036,20 @@ static void add_signaling_headers(switch_core_session_t *session, iks *iq_cmd, c
 static iks *on_rayo_accept(struct rayo_actor *call, struct rayo_message *msg, void *session_data)
 {
 	iks *node = msg->payload;
+	iks *accept = NULL;
 	switch_core_session_t *session = (switch_core_session_t *)session_data;
 	iks *response = NULL;
 
 	/* send ringing */
-	add_signaling_headers(session, iks_find(node, "accept"), RAYO_SIP_RESPONSE_HEADER);
-	switch_channel_pre_answer(switch_core_session_get_channel(session));
+	accept = iks_find(node, "accept");
+
+ 	add_signaling_headers(session, accept, RAYO_SIP_RESPONSE_HEADER);
+
+ 	if (!strcmp("true", iks_find_attrib_soft(accept, "early-media"))) {
+ 		/* send Early Media */
+ 		switch_channel_pre_answer(switch_core_session_get_channel(session));	
+ 	}
+
 	response = iks_new_iq_result(node);
 	return response;
 }
@@ -2110,11 +2129,8 @@ static iks *on_rayo_hangup(struct rayo_actor *call, struct rayo_message *msg, vo
 	iks *reason = iks_first_tag(hangup);
 	int hangup_cause = RAYO_CAUSE_HANGUP;
 
-	/* get hangup cause */
-	if (!reason && !strcmp("hangup", iks_name(hangup))) {
-		/* no reason in <hangup> */
-		hangup_cause = RAYO_CAUSE_HANGUP;
-	} else if (reason && !strcmp("reject", iks_name(hangup))) {
+	/* get or override hangup cause */
+ 	if (reason) {
 		char *reason_name = iks_name(reason);
 		/* reason required for <reject> */
 		if (!strcmp("busy", reason_name)) {
@@ -2124,10 +2140,8 @@ static iks *on_rayo_hangup(struct rayo_actor *call, struct rayo_message *msg, vo
 		} else if (!strcmp("error", reason_name)) {
 			hangup_cause = RAYO_CAUSE_ERROR;
 		} else {
-			response = iks_new_error_detailed(node, STANZA_ERROR_BAD_REQUEST, "invalid reject reason");
+			hangup_cause = RAYO_CAUSE_HANGUP;
 		}
-	} else {
-		response = iks_new_error(node, STANZA_ERROR_BAD_REQUEST);
 	}
 
 	/* do hangup */
@@ -3860,9 +3874,38 @@ static iks *rayo_create_offer(struct rayo_call *call, switch_core_session_t *ses
 		iks_insert_attrib(offer, "to", profile->destination_number);
 	}
 
+	if (globals.offer_uri && (val = switch_channel_get_variable(channel, "sip_req_uri"))) {
+ 		/* is a SIP call - pass the Request URI */
+ 		if (!strchr(val, ':')) {
+ 			iks_insert_attrib_printf(offer, "req_uri", "sip:%s", val);
+ 		} else {
+ 			iks_insert_attrib(offer, "req_uri", val);
+ 		}
+ 	}
+
+	if (globals.offer_uri && (val = switch_channel_get_variable(channel, "sip_req_params"))) {
+ 		/* is a SIP call - pass the Request URI Params */
+ 		iks_insert_attrib(offer, "req_params", val);
+ 	}
+
+ 	if (globals.offer_uri && (val = switch_channel_get_variable(channel, "sip_req_user"))) {
+ 		/* is a SIP call - pass the Request URI User */
+ 		iks_insert_attrib(offer, "req_user", val);
+ 	} else {
+ 		/* pass dialed number */
+ 		iks_insert_attrib(offer, "req_user", profile->destination_number);
+ 	}
+
 	add_header(offer, "from", switch_channel_get_variable(channel, "sip_full_from"));
 	add_header(offer, "to", switch_channel_get_variable(channel, "sip_full_to"));
 	add_header(offer, "via", switch_channel_get_variable(channel, "sip_full_via"));
+
+	if ( (val = switch_channel_get_variable_dup(channel, "sip_i_Diversion", SWITCH_FALSE, 0)) )  {
+ 		add_header(offer, "Diversion-Top", val);
+ 	}
+
+ 	add_header(offer, "version", "0.10.0");
+
 	add_channel_headers_to_event(offer, channel, globals.add_variables_to_offer);
 
 	return presence;
@@ -3898,7 +3941,9 @@ static switch_status_t rayo_call_on_read_frame(switch_core_session_t *session, s
  */
 static int should_offer_to_client(struct rayo_client *rclient, char **offer_filters, int offer_filter_count)
 {
-	if (rclient->availability != PS_ONLINE) {
+	if(globals.offer_algorithm == OFFER_FIXED){
+ 		return 1;
+ 	}else if (rclient->availability != PS_ONLINE) {
 		return 0;
 	}
 
@@ -3950,49 +3995,70 @@ static int send_offer_to_clients(struct rayo_call *from_call, switch_core_sessio
 	switch_hash_index_t *hi = NULL;
 	iks *offer = NULL;
 
-	if (from_call->num_acps <= 0) {
-		return 0;
-	}
+	if(globals.offer_algorithm == OFFER_FIXED){
+ 		/* send offer to client, remembering jid as PCP */
+ 		if (!offer) {
+ 			offer = rayo_create_offer(from_call, session);
+ 		}
+ 	switch_core_hash_insert(from_call->pcps, globals.offer_to_jid, "1");
+ 	iks_insert_attrib(offer, "to", globals.offer_to_jid);
+ 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Offering Call to: %s\n", globals.offer_to_jid);
 
-	if (globals.offer_algorithm == OFFER_RANDOM) {
-		/* pick client at (not really) random */
-		selection = rand() % from_call->num_acps;
-	} else if (globals.offer_algorithm == OFFER_FIRST) {
-		/* send to first client */
-		selection = 0;
-	} else {
-		/* send to all clients */
-		selection = -1;
-	}
+	RAYO_SEND_MESSAGE_DUP(from_call, globals.offer_to_jid, offer);
+	
+		sent = 1;		
+ 	
+ 	}else{
+		
+		if (from_call->num_acps <= 0) {
+ 			return 0;
+ 		}
 
-	for (hi = switch_core_hash_first(from_call->acps); hi; hi = switch_core_hash_next(&hi)) {
-		if (i++ == selection || selection == -1) {
-			const char *to_client_jid = NULL;
-			const void *key;
-			void *val;
+			if (globals.offer_algorithm == OFFER_RANDOM) {
+	 			/* pick client at (not really) random */
+	 			selection = rand() % from_call->num_acps;
+	 		} else if (globals.offer_algorithm == OFFER_FIRST) {
+	 			/* send to first client */
+	 			selection = 0;
+	 		} else {
+	 			/* send to all clients */
+	 			selection = -1;
+	 		}
 
-			/* get client jid to send to */
-			switch_core_hash_this(hi, &key, NULL, &val);
-			to_client_jid = (const char *)key;
-			switch_assert(to_client_jid);
+		for (hi = switch_core_hash_first(from_call->acps); hi; hi = switch_core_hash_next(&hi)) {
+ 			if (i++ == selection || selection == -1) {
+ 				const char *to_client_jid = NULL;
+ 				const void *key;
+ 				void *val;
 
-			/* send offer to client, remembering jid as PCP */
-			if (!offer) {
-				offer = rayo_create_offer(from_call, session);
-			}
-			switch_core_hash_insert(from_call->pcps, to_client_jid, "1");
-			iks_insert_attrib(offer, "to", to_client_jid);
-			RAYO_SEND_MESSAGE_DUP(from_call, to_client_jid, offer);
+ 				/* get client jid to send to */
+ 				switch_core_hash_this(hi, &key, NULL, &val);
+ 				to_client_jid = (const char *)key;
+ 				switch_assert(to_client_jid);
 
-			sent = 1;
-			from_call->num_acps--;
+ 				/* send offer to client, remembering jid as PCP */
+ 				if (!offer) {
+ 					offer = rayo_create_offer(from_call, session);
+ 				}
+ 				switch_core_hash_insert(from_call->pcps, to_client_jid, "1");
+ 				iks_insert_attrib(offer, "to", to_client_jid);
+ 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Offering Call to: %s\n", to_client_jid);
 
-			if (selection != -1) {
-				break;
+ 				RAYO_SEND_MESSAGE_DUP(from_call, to_client_jid, offer);
+
+ 				sent = 1;
+ 				//switch_core_hash_delete(from_call->acps, to_client_jid);
+ 				from_call->num_acps--;
+
+ 				if (selection != -1) {
+ 					break;
+ 				}
 			}
 		}
+
+		switch_safe_free(hi);
+
 	}
-	switch_safe_free(hi);
 
 	if (sent) {
 		/* remove offered client JID(s) from list of available clients */
@@ -4516,9 +4582,15 @@ static switch_status_t do_config(switch_memory_pool_t *pool, const char *config_
 						globals.offer_algorithm = OFFER_FIRST;
 					} else if (!strcasecmp(val, "random")) {
 						globals.offer_algorithm = OFFER_RANDOM;
+					} else if (!strcasecmp(val, "fixed")) {
+ 						globals.offer_algorithm = OFFER_FIXED;
 					} else {
 						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignoring invalid value for offer-algorithm \"%s\"\n", val);
 					}
+				} else if (!strcasecmp(var, "offer-fixed-jid")) {
+ 					if (!zstr(val)) {
+ 						globals.offer_to_jid = switch_core_strdup(pool, val);
+ 					}
 				} else {
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Unsupported param: %s\n", var);
 				}
